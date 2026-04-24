@@ -264,6 +264,36 @@ export OUT_DIR=$PWD/ttft_out
 Each mode is a separate Python subprocess (load + CUDA-graph capture
 happens 4 times). On a single H100-class GPU total wall is ~30 min.
 
+#### Per-method speculation budgets
+
+DFlash and EAGLE3 have **different** natural speculation budgets and the
+orchestrator treats them independently:
+
+| env var | default | what it controls |
+|---|---|---|
+| `DFLASH_NUM_SPEC` | `15` | DFlash `num_speculative_tokens`. Must equal `block_size - 1` of your DFlash drafter (z-lab b16 → 15). |
+| `EAGLE3_USE_TREE` | `1` | `1` = 32-node depth-6 static tree (approx of SGLang `--speculative-num-steps 6 --speculative-eagle-topk 10 --speculative-num-draft-tokens 32`). `0` = plain chain. |
+| `EAGLE3_NUM_SPEC` | `6` | EAGLE3 chain depth. Only used when `EAGLE3_USE_TREE=0`. |
+| `NUM_SPEC` | — | Legacy alias for `DFLASH_NUM_SPEC`; kept for backward compat. |
+
+Example: chain EAGLE3 at depth 4, DFlash at block_size 8:
+
+```bash
+DFLASH_NUM_SPEC=7 EAGLE3_USE_TREE=0 EAGLE3_NUM_SPEC=4 ./run_comprehensive.sh
+```
+
+#### Skipping modes
+
+The orchestrator reads per-mode skip flags so you can run subsets:
+
+```bash
+# Skip EAGLE3 entirely (e.g. no EAGLE3 drafter for your target):
+SKIP_EAGLE3=1 ./run_comprehensive.sh
+
+# Just compare optimized vs original (skip baselines):
+SKIP_NO_SPEC=1 SKIP_EAGLE3=1 ./run_comprehensive.sh
+```
+
 ### 4.7 Tabulate
 
 ```bash
@@ -279,18 +309,23 @@ Prints a per-scenario table for all 4 modes plus delta lines for
 ## 5. Running for gpt-oss-120b
 
 > **Note on drafter availability.** DFlash and EAGLE3 drafters are
-> target-specific — a drafter trained for Qwen3-8B will not work with
-> gpt-oss-120b. At the time of writing I am not aware of a public DFlash
-> drafter trained for gpt-oss-120b. You will need either (a) an
-> in-house drafter checkpoint or (b) to train one. For EAGLE3 the same
-> applies; check the drafter hub before assuming one exists.
->
-> If you only want the `no_spec` baseline and a DFlash test using a
-> locally-trained drafter, you can still run — just set
-> `DFLASH_MODEL` to your local path and skip the EAGLE3 mode by
-> editing the orchestrator.
+> target-specific. For `openai/gpt-oss-120b`:
+> - **EAGLE3** — NVIDIA publishes
+>   [`nvidia/gpt-oss-120b-Eagle3-long-context`](https://huggingface.co/nvidia/gpt-oss-120b-Eagle3-long-context)
+>   (for ≥8k contexts) and
+>   [`nvidia/gpt-oss-120b-Eagle3-short-context`](https://huggingface.co/nvidia/gpt-oss-120b-Eagle3-short-context)
+>   (for shorter contexts). Use these for the `eagle3` mode.
+> - **DFlash** — I am not aware of a public DFlash drafter trained for
+>   gpt-oss-120b. You will need your own checkpoint. If you only want
+>   the `no_spec` and `eagle3` baselines, set `SKIP_DFLASH_OPT=1
+>   SKIP_DFLASH_ORIG=1` to skip both DFlash modes.
 
-### 5.1 Suggested config for gpt-oss-120b
+### 5.1 Configuration for NVIDIA's `gpt-oss-120b-Eagle3-long-context`
+
+NVIDIA's model card recommends **`max_draft_len: 3`** (i.e. a chain of 3
+draft tokens, not a tree) with a benchmarked average acceptance rate of
+~2.32 tokens/step on MT-Bench. Their deployment example uses TP=8 and
+`max_seq_len=8192`. Mapped onto this script's knobs:
 
 ```bash
 export PY=/path/to/vllm/.venv/bin/python
@@ -298,45 +333,69 @@ export VLLM_REPO=/path/to/vllm
 export SHAREGPT_PATH=$HOME/data/sharegpt/ShareGPT_V4.3_unfiltered_cleaned_split.json
 export OUT_DIR=$PWD/ttft_out_gpt_oss
 
-export TARGET_MODEL="openai/gpt-oss-120b"   # or your local path
+export TARGET_MODEL="openai/gpt-oss-120b"
+export EAGLE3_MODEL="nvidia/gpt-oss-120b-Eagle3-long-context"
+
+# EAGLE3: NVIDIA recommends a 3-token chain, not a tree.
+export EAGLE3_USE_TREE=0
+export EAGLE3_NUM_SPEC=3
+
+# DFlash: replace with your own drafter + matching block size. Leave
+# these as-is and set SKIP_DFLASH_* if you don't have a drafter.
 export DFLASH_MODEL="/path/to/your/gpt-oss-120b-dflash-bXX"
-export EAGLE3_MODEL="/path/to/your/gpt-oss-120b-eagle3"   # or skip eagle3
-export NUM_SPEC=XX                        # = block_size - 1 of your DFlash drafter
-export MAX_MODEL_LEN=8192                 # drop to fit VRAM; raise if you have headroom
-export TP=4                               # or 8; match your GPU topology
+export DFLASH_NUM_SPEC=XX              # = block_size - 1 of your DFlash drafter
+
+# Everything else matches NVIDIA's recipe.
+export MAX_MODEL_LEN=8192
+export TP=8                            # NVIDIA's example; 4 also works on 80 GB cards
 export DTYPE=bfloat16
-export TRUST_REMOTE_CODE=1                # gpt-oss is likely to need this
+export TRUST_REMOTE_CODE=1             # gpt-oss MoE custom kernels
+
+# Skip the DFlash modes if no drafter is available.
+export SKIP_DFLASH_OPT=1
+export SKIP_DFLASH_ORIG=1
 
 ./run_comprehensive.sh 2>&1 | tee $OUT_DIR/driver.log
 $PY summarize.py --out-dir $OUT_DIR
 ```
 
-Knobs to tune (all env vars read by `run_comprehensive.sh`):
+> If your prompts fit under 8k, use the `short-context` variant instead
+> (NVIDIA recommends it for that regime — better accept rate). Just
+> change `EAGLE3_MODEL` to `nvidia/gpt-oss-120b-Eagle3-short-context`
+> and keep everything else identical.
 
-- `NUM_SPEC` — set to `block_size - 1` of whatever DFlash drafter you
-  use. That's the only number at which the drafter is behaving as
-  designed. The z-lab 8B drafter is `b16` → `NUM_SPEC=15`; for a b8
-  drafter it would be 7, etc. This matters because DFlash's query slice
-  is `1 + num_spec` and must equal the trained block size.
-- `TP` — tensor-parallel degree. For a 120B model at bf16 you typically
-  need TP=4 on 80 GB GPUs or TP=8 on 40 GB.
-- `MAX_MODEL_LEN` — caps `max_num_batched_tokens` indirectly. If you
-  reduce it, the persistent `_k_scratch` / `_v_scratch` buffers shrink
-  proportionally.
-- `NUM_CTX_*` / `--shared-prefix-tokens` — if gpt-oss-120b's tokenizer
-  splits ShareGPT very differently, pass overrides via the Python
-  driver directly (the bash script forwards whatever args it is given
-  after the fixed ones, or edit the script).
+### 5.2 Knobs to know
 
-### 5.2 Skipping EAGLE3 (no drafter available)
+All read by `run_comprehensive.sh`:
 
-If you don't have an EAGLE3 drafter for your target, edit
-`run_comprehensive.sh` and comment out the `run_mode eagle3` line, plus
-the corresponding block in `summarize.py`. The remaining 3-mode
-comparison (`no_spec`, `dflash_optimized`, `dflash_original`) is the
-one that directly measures whether this patch helps your target —
-`summarize.py` still prints those deltas even if `eagle3.json` is
-missing.
+| knob | meaning | default | NVIDIA gpt-oss-120b |
+|---|---|---|---|
+| `DFLASH_NUM_SPEC` | DFlash `num_speculative_tokens`; must equal `block_size − 1` of your drafter | 15 | depends on your checkpoint |
+| `EAGLE3_USE_TREE` | 1 = 32-node static tree; 0 = chain | 1 | **0** (NVIDIA uses a chain) |
+| `EAGLE3_NUM_SPEC` | EAGLE3 chain depth (ignored when `EAGLE3_USE_TREE=1`) | 6 | **3** |
+| `TP` | tensor-parallel degree | 1 | **8** |
+| `MAX_MODEL_LEN` | max sequence length; also caps `max_num_batched_tokens` | 16384 | **8192** |
+| `TRUST_REMOTE_CODE` | forwards `--trust-remote-code` to vLLM | 0 | **1** |
+| `SKIP_NO_SPEC` / `SKIP_EAGLE3` / `SKIP_DFLASH_OPT` / `SKIP_DFLASH_ORIG` | skip that mode | 0 | set to 1 for any drafter you don't have |
+
+### 5.3 Skipping modes when a drafter is missing
+
+Instead of editing the orchestrator, set the corresponding `SKIP_*`
+env var:
+
+```bash
+# No EAGLE3 drafter at all:
+SKIP_EAGLE3=1 ./run_comprehensive.sh
+
+# No DFlash drafter (e.g. today's gpt-oss-120b situation):
+SKIP_DFLASH_OPT=1 SKIP_DFLASH_ORIG=1 ./run_comprehensive.sh
+
+# Just EAGLE3 vs no-spec (smoke test of NVIDIA drafter, no DFlash):
+SKIP_DFLASH_OPT=1 SKIP_DFLASH_ORIG=1 ./run_comprehensive.sh
+```
+
+`summarize.py` tolerates missing JSON files and only prints deltas for
+the modes that ran.
 
 ### 5.3 What to look at in the output
 
