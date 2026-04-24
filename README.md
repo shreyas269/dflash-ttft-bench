@@ -264,6 +264,47 @@ Scenarios run sequentially in the **same** `LLM` object. The CUDA-graph
 cache, Triton autotune cache, and KV prefix cache all persist across
 scenarios within a mode.
 
+#### Exact request order within a mode
+
+```
+── warmup (3 requests, not counted) ──
+  warmup_1, warmup_2, warmup_3                  (seed 1001)
+
+── SERIAL_COLD (20 requests, all cold) ──
+  cold_1, cold_2, ..., cold_20                  (seed 42, all unique)
+
+── CACHE_HIT_REPEAT (20 requests) ──
+  A_miss, A_hit, A_hit, A_hit, A_hit,           ← prompt A (seed 123)
+  B_miss, B_hit, B_hit, B_hit, B_hit,           ← prompt B
+  C_miss, C_hit, C_hit, C_hit, C_hit,           ← prompt C
+  D_miss, D_hit, D_hit, D_hit, D_hit            ← prompt D
+  │
+  └─ Summary rows:
+       CACHE_HIT_MISS  = the 4 "_miss" requests  (n=4)
+       CACHE_HIT_HIT   = the 16 "_hit" requests  (n=16)
+
+── SHARED_PREFIX (15 requests, shared 2K prefix + unique 400-tok suffix) ──
+  s_1 (cold on full 2.4K prompt),               ← seed 7777
+  s_2, s_3, ..., s_15                           ← 2K prefix now cached; 400 cold
+  │
+  └─ Summary rows:
+       SHARED_PREFIX_FIRST  = s_1            (n=1)
+       SHARED_PREFIX_LATER  = s_2 through s_15  (n=14)
+
+── BATCH_4 (1 concurrent submit of 4 cold requests) ──
+  [b4_1, b4_2, b4_3, b4_4]                      (seed 200, submitted together)
+
+── BATCH_16 (1 concurrent submit of 16 cold requests) ──
+  [b16_1, ..., b16_16]                          (seed 300, submitted together)
+```
+
+**Important:** `CACHE_HIT_MISS` and `CACHE_HIT_HIT` are **not** run as "4
+misses in a row, then 16 hits in a row". They're interleaved — each
+`hit` request is fired **immediately after** the `miss` that populated
+its cache, with no cooling between. That's why CACHE_HIT_HIT is a
+true warm-cache measurement: the prompt is in cache and hasn't had a
+chance to be evicted.
+
 #### Why not respin between scenarios?
 
 Two reasons:
