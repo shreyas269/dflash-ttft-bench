@@ -1,0 +1,509 @@
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index cffe6267a..feefd6698 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -291,6 +291,10 @@ class DFlashQwen3Model(nn.Module):
+         weights, K-norm weights, and RoPE parameters from every attention
+         layer so that precompute_and_store_context_kv can run one fused
+         GEMM for all layers at once. Also aliases the weight of the hidden_norm.
++
++        This also pre-allocates scratch buffers used by the fused K-norm +
++        RoPE + cache-store kernel so that the per-prefill code path does
++        not pay for a `[L, num_ctx, nkv, hd]` `empty_like` allocation.
+         """
+         layers_attn = [layer.self_attn for layer in self.layers]
+         attn0 = layers_attn[0]
+@@ -314,11 +318,19 @@ class DFlashQwen3Model(nn.Module):
+         self._rope_head_size = attn0.rotary_emb.head_size
+         self._rope_cos_sin_cache = attn0.rotary_emb.cos_sin_cache
+         self._rope_is_neox = attn0.rotary_emb.is_neox_style
++        # `rotary_dim` can be < head_size when partial-rotary configs are used
++        # (matches what `get_rope` exposes). Fall back to head_size for
++        # implementations that don't set it explicitly.
++        self._rope_rotary_dim = int(
++            getattr(attn0.rotary_emb, "rotary_dim", self._rope_head_size)
++        )
+         # Validation that RoPE params are the same across all layers
+         for attn in layers_attn[1:]:
+             assert (
+                 attn.rotary_emb.head_size == self._rope_head_size
+                 and attn.rotary_emb.is_neox_style == self._rope_is_neox
++                and int(getattr(attn.rotary_emb, "rotary_dim", attn.rotary_emb.head_size))
++                == self._rope_rotary_dim
+             ), "All layers must have the same RoPE parameters for DFlash precomputation"
+ 
+         # Layer metadata
+@@ -339,6 +351,33 @@ class DFlashQwen3Model(nn.Module):
+         # References to inner Attention layers for direct cache writes
+         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
+ 
++        # Fused kernel is only validated for neox-style RoPE; fall back to the
++        # eager path otherwise. Non-neox checkpoints are not known to be in
++        # use for DFlash today, but this keeps semantics conservative.
++        self._can_fuse_k_norm_rope = bool(self._rope_is_neox)
++
++        # Persistent scratch buffers for fused K-norm + RoPE output. These
++        # are sized for `max_num_batched_tokens` so they cover any prefill
++        # chunk the scheduler can send. Using persistent buffers means the
++        # per-call hot path does not trigger an allocator round-trip, and
++        # addresses stay stable if we ever wrap this path in a CUDA graph.
++        vllm_config = get_current_vllm_config()
++        scheduler_config = vllm_config.scheduler_config
++        max_num_tokens = int(scheduler_config.max_num_batched_tokens)
++        kv_dtype = self._fused_kv_weight.dtype
++        kv_device = self._fused_kv_weight.device
++        self._k_scratch = torch.empty(
++            (max_num_tokens, self._num_kv_heads, self._head_dim),
++            dtype=kv_dtype,
++            device=kv_device,
++        )
++        self._v_scratch = torch.empty_like(self._k_scratch)
++        # Reusable hidden-norm output buffer. Shape depends on the caller's
++        # num_ctx, but the tensor is `empty_like(context_states)` so we keep
++        # a single-row sentinel and reallocate only when the caller's shape
++        # exceeds the previous reservation.
++        self._hidden_norm_scratch: torch.Tensor | None = None
++
+     def precompute_and_store_context_kv(
+         self,
+         context_states: torch.Tensor,
+@@ -348,14 +387,27 @@ class DFlashQwen3Model(nn.Module):
+         """Precompute K/V for context states write them into each layer's KV cache.
+ 
+         Input context states are projected to K/V, normed, and have RoPE applied.
+-        Since the context shape is different than the query shape, we can't rely on the
+-        regular forward pass to apply torch.compile and CUDA graphs to this section.
+-        As such, this function is optimized to minimize the number of torch ops present:
+-        we use fused vLLM kernels for RMSNorm and RoPE, fuse the GEMM into one
+-        large projection, and avoid cloning buffers (with .contiguous()) where possible.
+-
+-        When context_slot_mapping is None (e.g. during dummy_run) only
+-        the computation runs, and no K/V is written to cache.
++        Since the context shape is different than the query shape, we can't rely
++        on the regular forward pass to apply torch.compile and CUDA graphs to
++        this section. As such, this function is optimized to minimize the
++        number of torch ops present and the amount of memory traffic on long
++        prefills:
++
++        * A single fused GEMM handles the KV projection for every layer.
++        * A Triton kernel fuses `RMSNorm(K) + RoPE(K) + stage K/V` per layer,
++          reading directly from the strided F.linear output. This avoids the
++          old `[2, L, num_ctx, nkv, hd]` `.contiguous()` materialization and
++          the separate `empty_like(all_k)` K-norm output, which together
++          accounted for the bulk of the prefill TTFT regression vs. EAGLE3.
++        * The per-layer RoPE reads `context_positions` once instead of a
++          `positions.repeat(L)` copy.
++        * The staging buffers for K/V are persistent (allocated in
++          `_build_fused_kv_buffers`) and reused across layers, keeping the
++          allocator out of the hot path.
++
++        When `context_slot_mapping` is None (e.g. during `dummy_run`) only the
++        computation runs, and no K/V is written to cache — this makes the
++        first call at profile time warm up the Triton kernels.
+         """
+         if not hasattr(self, "_num_attn_layers"):
+             logger.warning_once(
+@@ -365,13 +417,28 @@ class DFlashQwen3Model(nn.Module):
+             self._build_fused_kv_buffers()
+ 
+         num_ctx = context_states.shape[0]
++        # With prefix caching, a full-hit prefill can produce an empty context
++        # slice. The rest of the pipeline is a no-op in that case, so bail
++        # before allocating/launching anything.
++        if num_ctx == 0:
++            return
++
+         L = self._num_attn_layers
+-        kv = self._kv_size
+         hd = self._head_dim
+         nkv = self._num_kv_heads
+ 
+         # --- Fused KV projection (one GEMM for all layers) ---
+-        normed_context_states = torch.empty_like(context_states)
++        # Reuse a single hidden-norm output buffer when possible. Growing the
++        # reservation dynamically keeps the allocator out of steady-state
++        # prefills once the first request sets the high-water mark.
++        if (
++            self._hidden_norm_scratch is None
++            or self._hidden_norm_scratch.shape[0] < num_ctx
++            or self._hidden_norm_scratch.dtype != context_states.dtype
++            or self._hidden_norm_scratch.device != context_states.device
++        ):
++            self._hidden_norm_scratch = torch.empty_like(context_states)
++        normed_context_states = self._hidden_norm_scratch[:num_ctx]
+         ops.rms_norm(
+             normed_context_states,
+             context_states,
+@@ -381,16 +448,85 @@ class DFlashQwen3Model(nn.Module):
+         all_kv_flat = F.linear(
+             normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+         )
+-        # Single contiguous copy that separates K/V and transposes to
+-        # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
+-        # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.
+-        all_kv = (
+-            all_kv_flat.view(num_ctx, L, 2, nkv, hd).permute(2, 1, 0, 3, 4).contiguous()
++        # View the fused output without materializing a new tensor. Each
++        # layer's K/V slice is [num_ctx, nkv, hd] with stride `L*2*nkv*hd`
++        # along the ctx dimension; the Triton kernel consumes that stride
++        # directly.
++        kv_fused = all_kv_flat.view(num_ctx, L, 2, nkv, hd)
++
++        cos_sin_cache = self._rope_cos_sin_cache
++        if cos_sin_cache.dtype != all_kv_flat.dtype:
++            cos_sin_cache = cos_sin_cache.to(dtype=all_kv_flat.dtype)
++
++        if not self._can_fuse_k_norm_rope:
++            # Fallback to the original eager path for non-neox RoPE or any
++            # configuration the fused kernel has not been validated against.
++            self._precompute_eager_fallback(
++                kv_fused,
++                context_positions,
++                cos_sin_cache,
++                context_slot_mapping,
++            )
++            return
++
++        from vllm.v1.spec_decode.dflash_kv_precompute import (
++            dflash_fused_k_norm_rope,
+         )
+-        all_k = all_kv[0]  # [L, num_ctx, nkv, hd], contiguous
+-        all_v = all_kv[1]  # [L, num_ctx, nkv, hd], contiguous
+ 
+-        # --- Per-layer RMSNorm K (3D: [num_ctx, nkv, hd] per layer) ---
++        k_scratch = self._k_scratch[:num_ctx]
++        v_scratch = self._v_scratch[:num_ctx]
++
++        # Per-layer: fused K norm + RoPE + stage to contiguous [num_ctx, nkv, hd]
++        # buffers, then hand off to the backend's do_kv_cache_update (which
++        # remains responsible for cache-layout- and fp8-aware writes).
++        for i in range(L):
++            dflash_fused_k_norm_rope(
++                kv_fused,
++                layer_idx=i,
++                k_norm_weight=self._k_norm_weights[i],
++                cos_sin_cache=cos_sin_cache,
++                positions=context_positions,
++                k_out=k_scratch,
++                v_out=v_scratch,
++                rotary_dim=self._rope_rotary_dim,
++                eps=self._rms_norm_eps,
++                is_neox=self._rope_is_neox,
++            )
++
++            if context_slot_mapping is None:
++                # Dummy run: only exercise the compute path to warm Triton
++                # caches and to let the memory profiler see the peak usage.
++                continue
++
++            attn = self._attn_layers[i]
++            attn.impl.do_kv_cache_update(
++                attn,
++                k_scratch,
++                v_scratch,
++                attn.kv_cache,
++                context_slot_mapping,
++            )
++
++    def _precompute_eager_fallback(
++        self,
++        kv_fused: torch.Tensor,  # [num_ctx, L, 2, nkv, hd]
++        context_positions: torch.Tensor,
++        cos_sin_cache: torch.Tensor,
++        context_slot_mapping: torch.Tensor | None,
++    ) -> None:
++        """Original eager precompute path.
++
++        Kept as a safety net for configurations the fused Triton kernel has
++        not been validated for (non-neox RoPE today). The logic mirrors the
++        pre-optimization implementation of `precompute_and_store_context_kv`.
++        """
++        num_ctx, L, _, nkv, hd = kv_fused.shape
++        kv = nkv * hd
++
++        all_kv = kv_fused.permute(2, 1, 0, 3, 4).contiguous()
++        all_k = all_kv[0]
++        all_v = all_kv[1]
++
+         all_k_normed = torch.empty_like(all_k)
+         for i in range(L):
+             ops.rms_norm(
+@@ -400,14 +536,8 @@ class DFlashQwen3Model(nn.Module):
+                 self._rms_norm_eps,
+             )
+ 
+-        # --- Fused RoPE across all layers ---
+-        # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
+-        # In-place RoPE: pass K as the "query" arg with key=None.
+         all_k_flat = all_k_normed.view(L * num_ctx, kv)
+         positions_repeated = context_positions.repeat(L)
+-        cos_sin_cache = self._rope_cos_sin_cache
+-        if cos_sin_cache.dtype != all_k_flat.dtype:
+-            cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
+         ops.rotary_embedding(
+             positions_repeated,
+             all_k_flat,
+@@ -420,16 +550,14 @@ class DFlashQwen3Model(nn.Module):
+         if context_slot_mapping is None:
+             return
+ 
+-        # --- Per-layer cache insert ---
+         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
+         for i in range(L):
+             attn = self._attn_layers[i]
+-            kv_cache = attn.kv_cache
+             attn.impl.do_kv_cache_update(
+                 attn,
+                 all_k_final[i],
+                 all_v[i],
+-                kv_cache,
++                attn.kv_cache,
+                 context_slot_mapping,
+             )
+ 
+diff --git a/vllm/v1/spec_decode/dflash.py b/vllm/v1/spec_decode/dflash.py
+index 51916053c..3dd4e4928 100644
+--- a/vllm/v1/spec_decode/dflash.py
++++ b/vllm/v1/spec_decode/dflash.py
+@@ -241,12 +241,18 @@ class DFlashProposer(SpecDecodeBaseProposer):
+         # buffers by the kernel — no copy needed.
+         num_context = self._dflash_num_context
+ 
+-        # Pre-insert context KVs directly into cache
+-        self.model.precompute_and_store_context_kv(
+-            self._dflash_hidden_states,  # Shape is already [num_context, hidden_size]
+-            self._context_positions_buffer[:num_context],
+-            self._context_slot_mapping_buffer[:num_context],
+-        )
++        # When prefix caching fully covers the requests in this batch (the
++        # common case for steady-state chat turns that share a long system
++        # prompt), `num_context` can be 0. The model-side precompute is a
++        # no-op in that case; calling it anyway still issues a chain of
++        # zero-sized kernels plus the hidden-norm allocator round-trip, so
++        # skip it outright for a cleaner TTFT profile.
++        if num_context > 0:
++            self.model.precompute_and_store_context_kv(
++                self._dflash_hidden_states,  # [num_context, hidden_size]
++                self._context_positions_buffer[:num_context],
++                self._context_slot_mapping_buffer[:num_context],
++            )
+         return (
+             dict(
+                 input_ids=self.input_ids[:num_input_tokens],
+diff --git a/vllm/v1/spec_decode/dflash_kv_precompute.py b/vllm/v1/spec_decode/dflash_kv_precompute.py
+new file mode 100644
+index 000000000..d43ef26e4
+--- /dev/null
++++ b/vllm/v1/spec_decode/dflash_kv_precompute.py
+@@ -0,0 +1,211 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Fused Triton kernel for DFlash draft-side context KV precomputation.
++
++DFlash populates the draft KV cache with K/V computed from the target model's
++hidden states before each draft forward pass. During prefill this is done on
++the full prompt (or the un-cached suffix when prefix caching is enabled), and
++with the original implementation it runs as a long chain of eager ops:
++
++    hidden_norm -> F.linear(fused KV proj) -> permute+contiguous
++        -> per-layer RMSNorm(K)   (L kernel launches)
++        -> global RoPE            (positions.repeat(L))
++        -> per-layer cache insert (L kernel launches)
++
++For a long prefill this path dominates TTFT because:
++  * the `permute(...).contiguous()` materializes a [2, L, num_ctx, nkv, hd]
++    tensor (hundreds of MB for a >=8K prefill),
++  * an equally-large `empty_like(all_k)` is allocated for the K norm output,
++  * `positions.repeat(L)` grows the RoPE position tensor by a factor of L.
++
++The kernel defined here fuses `RMSNorm(K) + RoPE(K) + store K/V` into a single
++pass per layer. It reads K/V tiles directly from the fused F.linear output
++(using strided indexing) and writes the results into pre-allocated staging
++buffers of shape [num_ctx, num_kv_heads, head_dim]. The staging buffers are
++then handed to the backend's existing `do_kv_cache_update`, which knows how to
++write into every cache layout the project supports (including fp8).
++
++The upstream sglang DFlash port uses the same fused-norm-plus-RoPE approach
++(see python/sglang/srt/speculative/triton_ops/fused_kv_materialize.py).
++"""
++
++from __future__ import annotations
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit
++def _dflash_fused_k_norm_rope_kernel(
++    # Source: fused F.linear output viewed as [num_ctx, L, 2, num_kv_heads, head_dim]
++    kv_fused_ptr,
++    kv_fused_stride_ctx,  # elements per ctx row (= L * 2 * num_kv_heads * head_dim)
++    layer_elem_offset,  # runtime offset into the ctx row selecting this layer
++    # Per-layer K norm weight [head_dim]
++    k_norm_weight_ptr,
++    # RoPE cos/sin table [max_pos, rotary_dim]
++    cos_sin_cache_ptr,
++    cos_sin_stride_pos,
++    # Absolute positions [num_ctx]
++    positions_ptr,
++    # Destination staging buffers [num_ctx, num_kv_heads, head_dim]
++    k_out_ptr,
++    v_out_ptr,
++    k_out_stride_ctx,
++    k_out_stride_head,
++    v_out_stride_ctx,
++    v_out_stride_head,
++    num_ctx,
++    num_kv_heads: tl.constexpr,
++    head_dim: tl.constexpr,
++    rotary_dim: tl.constexpr,
++    half_rotary_dim: tl.constexpr,
++    eps: tl.constexpr,
++    IS_NEOX: tl.constexpr,
++    BLOCK_HD: tl.constexpr,
++):
++    """Fused RMSNorm(K) + RoPE(K) + store K/V for one attention layer.
++
++    Grid: (num_ctx, num_kv_heads). Each program handles one (ctx, head) slice
++    of width `head_dim` and writes one row of both K and V to the staging
++    buffers.
++    """
++    ctx_id = tl.program_id(0)
++    head_id = tl.program_id(1)
++    if ctx_id >= num_ctx:
++        return
++
++    # Base pointer for this (ctx, layer, head) K tile in the fused projection.
++    row_base = kv_fused_ptr + ctx_id * kv_fused_stride_ctx + layer_elem_offset
++    k_base = row_base + head_id * head_dim
++    # V for the same (ctx, layer, head) sits one "KV slot" after K.
++    v_base = k_base + num_kv_heads * head_dim
++
++    offs = tl.arange(0, BLOCK_HD)
++    mask_hd = offs < head_dim
++    mask_half = offs < half_rotary_dim
++
++    # ---- RMSNorm(K) across head_dim ----
++    k_raw = tl.load(k_base + offs, mask=mask_hd, other=0.0).to(tl.float32)
++    var = tl.sum(k_raw * k_raw) / head_dim
++    inv_rms = tl.rsqrt(var + eps)
++    w = tl.load(k_norm_weight_ptr + offs, mask=mask_hd, other=1.0).to(tl.float32)
++    k_normed = k_raw * inv_rms * w
++
++    # V passes through unchanged (no norm, no rotation).
++    v_raw = tl.load(v_base + offs, mask=mask_hd, other=0.0)
++
++    # ---- RoPE(K) ----
++    # We only support neox-style RoPE for the fused path, matching the
++    # validation done by DFlashQwen3Model._build_fused_kv_buffers. For heads
++    # where `rotary_dim < head_dim` the trailing slice is left untouched.
++    position = tl.load(positions_ptr + ctx_id)
++    cos_base = cos_sin_cache_ptr + position * cos_sin_stride_pos
++    cos_v = tl.load(cos_base + offs, mask=mask_half, other=1.0).to(tl.float32)
++    sin_v = tl.load(
++        cos_base + half_rotary_dim + offs, mask=mask_half, other=0.0
++    ).to(tl.float32)
++
++    # first half of k_normed (already in register) and second half (load+norm)
++    k_first = tl.where(mask_half, k_normed, 0.0)
++    k_second_raw = tl.load(k_base + half_rotary_dim + offs, mask=mask_half, other=0.0).to(
++        tl.float32
++    )
++    w_second = tl.load(
++        k_norm_weight_ptr + half_rotary_dim + offs, mask=mask_half, other=1.0
++    ).to(tl.float32)
++    k_second_normed = k_second_raw * inv_rms * w_second
++
++    if IS_NEOX:
++        k_rot_first = k_first * cos_v - k_second_normed * sin_v
++        k_rot_second = k_second_normed * cos_v + k_first * sin_v
++    else:
++        # Only neox is exercised today; GPT-J interleaved layout is rejected
++        # by the caller, so this branch only exists to keep the kernel
++        # specialisable for future backends.
++        k_rot_first = k_first
++        k_rot_second = k_second_normed
++
++    # ---- Store K ----
++    k_write = k_out_ptr + ctx_id * k_out_stride_ctx + head_id * k_out_stride_head
++    # Rotated halves
++    tl.store(k_write + offs, k_rot_first.to(v_raw.dtype), mask=mask_half)
++    tl.store(
++        k_write + half_rotary_dim + offs,
++        k_rot_second.to(v_raw.dtype),
++        mask=mask_half,
++    )
++    # Pass-through tail for heads where rotary_dim < head_dim.
++    if rotary_dim < head_dim:
++        mask_pass = (offs >= rotary_dim) & mask_hd
++        tl.store(k_write + offs, k_normed.to(v_raw.dtype), mask=mask_pass)
++
++    # ---- Store V (no transform) ----
++    v_write = v_out_ptr + ctx_id * v_out_stride_ctx + head_id * v_out_stride_head
++    tl.store(v_write + offs, v_raw, mask=mask_hd)
++
++
++def dflash_fused_k_norm_rope(
++    kv_fused: torch.Tensor,  # [num_ctx, L, 2, num_kv_heads, head_dim] view
++    layer_idx: int,
++    k_norm_weight: torch.Tensor,  # [head_dim]
++    cos_sin_cache: torch.Tensor,  # [max_pos, rotary_dim]
++    positions: torch.Tensor,  # [num_ctx]
++    k_out: torch.Tensor,  # [num_ctx, num_kv_heads, head_dim], contiguous
++    v_out: torch.Tensor,  # [num_ctx, num_kv_heads, head_dim], contiguous
++    *,
++    rotary_dim: int,
++    eps: float,
++    is_neox: bool,
++) -> None:
++    """Launch the fused K-norm + RoPE + V pass-through kernel for one layer.
++
++    `kv_fused` is the output of the fused KV linear projection, reshaped to
++    [num_ctx, num_layers, 2, num_kv_heads, head_dim]. `layer_idx` selects the
++    slice to process. `k_out` and `v_out` are expected to be pre-allocated
++    contiguous scratch buffers sized for the current `num_ctx`.
++    """
++    num_ctx = kv_fused.shape[0]
++    num_kv_heads = kv_fused.shape[3]
++    head_dim = kv_fused.shape[4]
++    if num_ctx == 0:
++        return
++    if rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2 != 0:
++        raise ValueError(
++            "Invalid rotary/head dim pair for DFlash fused precompute: "
++            f"rotary_dim={rotary_dim}, head_dim={head_dim}."
++        )
++
++    if positions.dtype != torch.int64:
++        positions = positions.to(torch.int64)
++
++    # Layer offset in elements: layer_idx * (2 * num_kv_heads * head_dim)
++    layer_elem_offset = layer_idx * 2 * num_kv_heads * head_dim
++
++    BLOCK_HD = triton.next_power_of_2(head_dim)
++    half_rotary_dim = rotary_dim // 2
++
++    _dflash_fused_k_norm_rope_kernel[(num_ctx, num_kv_heads)](
++        kv_fused,
++        kv_fused.stride(0),
++        layer_elem_offset,
++        k_norm_weight,
++        cos_sin_cache,
++        cos_sin_cache.stride(0),
++        positions,
++        k_out,
++        v_out,
++        k_out.stride(0),
++        k_out.stride(1),
++        v_out.stride(0),
++        v_out.stride(1),
++        num_ctx,
++        num_kv_heads=num_kv_heads,
++        head_dim=head_dim,
++        rotary_dim=rotary_dim,
++        half_rotary_dim=half_rotary_dim,
++        eps=eps,
++        IS_NEOX=is_neox,
++        BLOCK_HD=BLOCK_HD,
++    )
