@@ -152,7 +152,200 @@ token-for-token on the scripted prompts in this benchmark.
 
 ---
 
-## 3. Results I observed (Qwen3-8B, GB10)
+## 3. Reading the output
+
+Each mode writes a JSON to `$OUT_DIR/<mode>.json` plus a matching
+`.log` file. `summarize.py` reads all four JSONs and prints a per-
+scenario table. Before looking at numbers, make sure you know what's
+being measured and how the scenarios differ.
+
+### 3.1 What's measured — TTFT only
+
+Every number in the summary is **time-to-first-token (TTFT), in
+milliseconds**. The bench driver submits each prompt with
+`max_tokens=1`:
+
+```python
+sp = SamplingParams(temperature=0.0, max_tokens=1)
+tic = time.perf_counter()
+_ = llm.generate([p], sp)                 # blocks until 1 token returns
+lats.append(time.perf_counter() - tic)
+```
+
+So each latency covers: prompt submit → prefill → drafter setup →
+first sampled token → return. **No decode steps.**
+
+Why TTFT only: PR #36847's regression was in the prefill / drafter
+setup path. Speculative decoding pays back on **decode throughput**,
+not TTFT. If you want decode-throughput numbers, that's a different
+benchmark (set `max_tokens=128`, measure `(out_tokens - 1) / (total
+- first_token_time)`). This one deliberately doesn't.
+
+### 3.2 The scenarios
+
+The five serial scenarios + two batched scenarios control the mix of
+cold-prefill vs. cached-prefix work. Prefix caching is ON for all of
+them; what changes is whether any given request actually hits the
+cache.
+
+| scenario | cache state | n | what it models | what it stresses |
+|---|---|---|---|---|
+| `SERIAL_COLD` | fully cold | 20 | 20 different users each ask a fresh question | baseline prefill speed, wide range of prompt lengths |
+| `CACHE_HIT_MISS` | cold (1st send of each of 4 prompts) | 4 | sanity check, narrow set | cold-prefill on repeated shapes (noisy, n=4) |
+| `CACHE_HIT_HIT` | fully warm (sends 2–5 of each of 4 prompts) | 16 | "regenerate response" button, retry after error | **warm-cache floor** — target does almost nothing, only drafter-setup overhead is visible |
+| `SHARED_PREFIX_FIRST` | cold | 1 | first user of the day hits a cold system prompt | reference point, not statistically meaningful |
+| `SHARED_PREFIX_LATER` | partial hit (2K cached + 400 cold) | 14 | production chat: long shared system prompt + short user turn | **the realistic workload** — best predictor of production TTFT |
+| `BATCH_4` | cold, concurrent | 4 | small burst of simultaneous users | concurrent-prefill scheduler efficiency |
+| `BATCH_16` | cold, concurrent | 16 | large burst of simultaneous users | larger-batch scheduler + drafter-per-seq overhead |
+
+> The names `CACHE_HIT_MISS` / `CACHE_HIT_HIT` come from the underlying
+> *experiment*: send the same prompt 5 times, split the first send
+> (miss) from sends 2–5 (hit). Mentally translating them to
+> `REPEAT_FIRST_COLD` / `REPEAT_WARM_HIT` may help.
+
+**The two rows that matter most in practice:**
+
+1. `CACHE_HIT_HIT` — how cheap is a warm request? Your floor.
+2. `SHARED_PREFIX_LATER` — how cheap is a typical production request?
+
+Everything else is context and sanity checks.
+
+### 3.3 The summary columns
+
+Each scenario prints one row per mode with these columns:
+
+| column | meaning | when to trust it |
+|---|---|---|
+| `n` | number of requests in this row | bigger is better; p99 needs n≥50 to be meaningful |
+| `min` | fastest TTFT in the sample | always noisy |
+| `p50` | median — half faster, half slower | **your typical user experience** |
+| `mean` | arithmetic average | compare to p50: if `mean >> p50`, distribution is right-skewed (outliers pulling up) |
+| `p90` | 10% of requests were slower | **the SLO number for interactive workloads** |
+| `p95` / `p99` | tail percentiles | only meaningful with many samples (n=20 makes p99 ≈ max) |
+| `max` | slowest single request | one data point, noisy |
+| `max/p50` | tail spread ratio | `1.0x` = uniform; `2.0x+` = wide prompt-length distribution. This is **prompt-driven, not drafter-driven** — not a regression signal |
+
+Best signals for mode-to-mode comparison: `p50` and `p90`. Ignore `p99`
+and `max` unless you're running the sweep with n≫20.
+
+### 3.4 The Δ (delta) rows — sign convention
+
+After the per-mode rows, each scenario prints three delta rows:
+
+```
+Δ dflash_original vs eagle3              p50= -9.8%  p90= -7.4%  p99= -7.3%  max= -7.3%
+Δ dflash_optimized vs eagle3             p50= -9.6%  p90= -7.4%  p99= -7.2%  max= -7.3%
+Δ dflash_optimized vs dflash_original    p50= +0.2%  p90= +0.0%  p99= +0.1%  max= +0.0%
+```
+
+Sign convention: **negative = faster, positive = slower**.
+
+`p50 = −9.6%` means "A's p50 is 9.6% lower (faster) than B's p50".
+
+The three rows answer three different questions:
+
+1. **`dflash_original vs eagle3`** → Does DFlash-as-shipped beat EAGLE3 on this workload?
+2. **`dflash_optimized vs eagle3`** → Does DFlash *with the patch* still beat EAGLE3?
+3. **`dflash_optimized vs dflash_original`** → **Did the patch help, hurt, or do nothing?** This is the row that evaluates the optimization itself.
+
+### 3.5 Methodology — what actually runs, in what order
+
+**One vLLM instance per mode, four modes = four subprocesses.** Inside
+one subprocess:
+
+```
+spawn → load model (~1 min) → CUDA-graph capture (2–5 min) →
+  warmup (3 non-counted ShareGPT prompts, seed 1001) →
+  SERIAL_COLD → CACHE_HIT_REPEAT → SHARED_PREFIX → BATCH_4 → BATCH_16 →
+teardown
+```
+
+Scenarios run sequentially in the **same** `LLM` object. The CUDA-graph
+cache, Triton autotune cache, and KV prefix cache all persist across
+scenarios within a mode.
+
+#### Why not respin between scenarios?
+
+Two reasons:
+
+1. **`CACHE_HIT_HIT` requires shared state by construction.** The
+   whole point of that row is "prompt A is cached from a previous
+   send of prompt A" — if the engine respun, the cache would be
+   empty and the experiment wouldn't exist.
+2. **Cost.** Each respin is ~3 min. 5 scenarios × 4 modes × 3 min =
+   60 min of pure overhead per sweep. A full sweep is already ~30
+   min; respinning between scenarios would triple it.
+
+#### Ordering bias — and why the Δ rows are still valid
+
+Because scenarios share state within a mode, there's a small bias:
+
+- `SERIAL_COLD` runs first and bears any first-real-request CUDA
+  graph / Triton compile cost not covered by the 3-prompt warmup.
+- `BATCH_4` / `BATCH_16` at the end may hit batch graph shapes not
+  pre-captured at startup.
+- Later serial scenarios benefit from the warmed CUDA-graph cache.
+
+**But this bias is the same for all four modes** (same order, same
+warmup, same seeds). When you look at `Δ dflash_optimized vs
+dflash_original`, both numerator and denominator carry the same
+bias → it cancels. Absolute TTFT numbers may be slightly off; the
+**deltas are clean**.
+
+#### Prefix cache leakage across scenarios
+
+Prompts aren't flushed between scenarios. But each scenario draws its
+prompts from a different ShareGPT slice using a different RNG seed,
+so there's no accidental overlap that would turn a cold request into
+a false warm hit. Under extreme memory pressure earlier prompts
+could evict, but that would only hurt later cold scenarios — still
+identical across modes.
+
+#### Prompt determinism — identical prompts every mode, every run
+
+Every scenario's prompt set is deterministic:
+
+| scenario | seed | pool size |
+|---|---|---|
+| warmup | 1001 | 3 |
+| SERIAL_COLD | 42 | 20 |
+| CACHE_HIT_REPEAT | 123 | 4 (×5 each) |
+| SHARED_PREFIX | 7777 | 15 |
+| BATCH_4 | 200 | 4 |
+| BATCH_16 | 300 | 16 |
+
+The selection is `random.Random(seed).shuffle(data)` followed by a
+token-length filter using the tokenizer of `--target`. With the same
+ShareGPT file, the same target, and the same seeds, **every mode
+sees byte-for-byte identical prompts in the same order**.
+
+### 3.6 How to actually read a sweep — decision tree
+
+1. **Sanity check.** Does `no_spec` have the lowest TTFT in every
+   scenario? If not, something is wrong (speculation only adds
+   overhead on prefill).
+2. **DFlash vs EAGLE3.** Look at `Δ dflash_optimized vs eagle3`. If
+   `p50` and `p90` are consistently negative, DFlash wins on
+   prefill. If `p99` turns positive while `p50` is negative, DFlash's
+   tail is worse.
+3. **Did the patch help?** Look at `Δ dflash_optimized vs
+   dflash_original`. Interpretations:
+   - All within ±1–2% → patch is a no-op on this workload (not a
+     bug; the optimization targets a path that isn't the bottleneck
+     here).
+   - Negative p50/p90/p99 → patch helps.
+   - Big negative in `CACHE_HIT_HIT` specifically → the
+     `num_ctx == 0` early-return is firing (full-cache-hit requests
+     are skipping the drafter precompute).
+   - Negative delta in `SERIAL_COLD` / `SHARED_PREFIX_LATER`
+     scaling with prompt length → the fused K-norm+RoPE kernel is
+     winning over the old `.contiguous()` + `positions.repeat(L)`
+     pipeline.
+4. **What to ignore.** `n=1` rows (`SHARED_PREFIX_FIRST`), `max`
+   differences under n<50, `p99` under n<50.
+
+
+## 4. Results I observed (Qwen3-8B, GB10)
 
 Full table is produced by `summarize.py`; the short version at
 `num_speculative_tokens=15` (block_size=16 match for the z-lab drafter)
@@ -185,16 +378,16 @@ Headlines:
 
 ---
 
-## 4. Running the benchmark
+## 5. Running the benchmark
 
-### 4.1 Prerequisites
+### 5.1 Prerequisites
 
 - Linux + NVIDIA GPU with enough VRAM for target + drafter (Qwen3-8B
   needs ~30 GB in bf16; gpt-oss-120b needs TP≥2 or a big device).
 - `uv` (recommended) or any Python 3.11/3.12 venv.
 - `git`, `gh` (optional, for repo operations).
 
-### 4.2 Clone vLLM and apply the patch
+### 5.2 Clone vLLM and apply the patch
 
 > **The benchmark script does NOT apply the patch for you. You must
 > apply it once, manually, before running the orchestrator.** The
@@ -232,7 +425,7 @@ git checkout -- vllm/model_executor/models/qwen3_dflash.py \
 rm vllm/v1/spec_decode/dflash_kv_precompute.py
 ```
 
-### 4.3 Build vLLM
+### 5.3 Build vLLM
 
 From the vLLM repo root:
 
@@ -248,7 +441,7 @@ uv pip install "transformers>=4.45" datasets huggingface_hub
 If you need C++/CUDA changes (you shouldn't for this patch), drop
 `VLLM_USE_PRECOMPILED=1`.
 
-### 4.4 Download ShareGPT
+### 5.4 Download ShareGPT
 
 The bench samples prompts from
 [ShareGPT_Vicuna_unfiltered](https://huggingface.co/datasets/Aeala/ShareGPT_Vicuna_unfiltered).
@@ -262,7 +455,7 @@ huggingface-cli download Aeala/ShareGPT_Vicuna_unfiltered \
 #   ~/data/sharegpt/ShareGPT_V4.3_unfiltered_cleaned_split.json
 ```
 
-### 4.5 Pre-fetch the models
+### 5.5 Pre-fetch the models
 
 The orchestrator runs with `HF_HUB_OFFLINE=1` recommended so it doesn't
 stall on a flaky network mid-run. Pre-fetch everything once:
@@ -273,7 +466,7 @@ huggingface-cli download z-lab/Qwen3-8B-DFlash-b16
 huggingface-cli download Tengyunw/qwen3_8b_eagle3
 ```
 
-### 4.6 Run the sweep (Qwen3-8B default)
+### 5.6 Run the sweep (Qwen3-8B default)
 
 ```bash
 cd /path/to/dflash-ttft-bench
@@ -318,7 +511,7 @@ SKIP_EAGLE3=1 ./run_comprehensive.sh
 SKIP_NO_SPEC=1 SKIP_EAGLE3=1 ./run_comprehensive.sh
 ```
 
-### 4.7 Tabulate
+### 5.7 Tabulate
 
 ```bash
 $PY summarize.py --out-dir $OUT_DIR
@@ -330,7 +523,7 @@ Prints a per-scenario table for all 4 modes plus delta lines for
 
 ---
 
-## 5. Running for gpt-oss-120b
+## 6. Running for gpt-oss-120b
 
 > **Note on drafter availability.** DFlash and EAGLE3 drafters are
 > target-specific. For `openai/gpt-oss-120b`:
@@ -344,7 +537,7 @@ Prints a per-scenario table for all 4 modes plus delta lines for
 >   the `no_spec` and `eagle3` baselines, set `SKIP_DFLASH_OPT=1
 >   SKIP_DFLASH_ORIG=1` to skip both DFlash modes.
 
-### 5.1 Configuration for NVIDIA's `gpt-oss-120b-Eagle3-long-context`
+### 6.1 Configuration for NVIDIA's `gpt-oss-120b-Eagle3-long-context`
 
 NVIDIA's model card recommends **`max_draft_len: 3`** (i.e. a chain of 3
 draft tokens, not a tree) with a benchmarked average acceptance rate of
@@ -388,7 +581,7 @@ $PY summarize.py --out-dir $OUT_DIR
 > change `EAGLE3_MODEL` to `nvidia/gpt-oss-120b-Eagle3-short-context`
 > and keep everything else identical.
 
-### 5.2 Knobs to know
+### 6.2 Knobs to know
 
 All read by `run_comprehensive.sh`:
 
@@ -402,7 +595,7 @@ All read by `run_comprehensive.sh`:
 | `TRUST_REMOTE_CODE` | forwards `--trust-remote-code` to vLLM | 0 | **1** |
 | `SKIP_NO_SPEC` / `SKIP_EAGLE3` / `SKIP_DFLASH_OPT` / `SKIP_DFLASH_ORIG` | skip that mode | 0 | set to 1 for any drafter you don't have |
 
-### 5.3 Skipping modes when a drafter is missing
+### 6.3 Skipping modes when a drafter is missing
 
 Instead of editing the orchestrator, set the corresponding `SKIP_*`
 env var:
@@ -421,7 +614,7 @@ SKIP_DFLASH_OPT=1 SKIP_DFLASH_ORIG=1 ./run_comprehensive.sh
 `summarize.py` tolerates missing JSON files and only prints deltas for
 the modes that ran.
 
-### 5.3 What to look at in the output
+### 6.4 What to look at in the output
 
 The patch should most show up on:
 
@@ -438,7 +631,7 @@ On a bigger target with a taller drafter, I'd expect a larger delta.
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 - **`git stash pop` conflict after a run** — means the run crashed
   between the stash push and pop. Fix: `cd $VLLM_REPO && git stash
@@ -458,7 +651,7 @@ On a bigger target with a taller drafter, I'd expect a larger delta.
 
 ---
 
-## 7. Applying the vLLM patch in a fresh tree
+## 8. Applying the vLLM patch in a fresh tree
 
 ```bash
 cd /path/to/vllm
@@ -473,7 +666,7 @@ is trivial.
 
 ---
 
-## 8. Notes on the EAGLE3 tree
+## 9. Notes on the EAGLE3 tree
 
 vLLM requires a static `speculative_token_tree`. The Tengyunw README
 recommends SGLang's
