@@ -86,6 +86,32 @@ fi
 
 mkdir -p "$OUT_DIR"
 
+# Preflight: verify the optimization patch is actually applied in the vLLM
+# working tree. If it isn't, `dflash_optimized` and `dflash_original` would
+# both run upstream code and you'd get an apples-to-apples NULL result
+# silently. Skip this check only when both DFlash modes are skipped.
+if [[ "$SKIP_DFLASH_OPT" != "1" || "$SKIP_DFLASH_ORIG" != "1" ]]; then
+    missing_patch=0
+    if [[ ! -f "$VLLM_REPO/vllm/v1/spec_decode/dflash_kv_precompute.py" ]]; then
+        missing_patch=1
+    fi
+    # The patch touches these two tracked files; both should show as modified.
+    for f in vllm/model_executor/models/qwen3_dflash.py vllm/v1/spec_decode/dflash.py; do
+        if ! (cd "$VLLM_REPO" && git diff --quiet -- "$f"); then
+            :  # modified, as expected
+        else
+            missing_patch=1
+        fi
+    done
+    if [[ "$missing_patch" == "1" ]]; then
+        echo "ERROR: optimization patch does not appear to be applied in $VLLM_REPO" >&2
+        echo "       Expected: 2 tracked files modified + vllm/v1/spec_decode/dflash_kv_precompute.py present." >&2
+        echo "       Run:  cd \"$VLLM_REPO\" && git apply /path/to/dflash-ttft-bench/dflash_ttft_fix.patch" >&2
+        echo "       Then re-run this script. (Or set SKIP_DFLASH_OPT=1 SKIP_DFLASH_ORIG=1 to skip the DFlash modes.)" >&2
+        exit 1
+    fi
+fi
+
 echo "=== config ==="
 echo "  PY                $PY"
 echo "  VLLM_REPO         $VLLM_REPO"

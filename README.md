@@ -196,17 +196,41 @@ Headlines:
 
 ### 4.2 Clone vLLM and apply the patch
 
+> **The benchmark script does NOT apply the patch for you. You must
+> apply it once, manually, before running the orchestrator.** The
+> script just swaps the patched edits in and out via `git stash`.
+
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
 git apply /path/to/dflash-ttft-bench/dflash_ttft_fix.patch
 git status --short          # should show 2 M + 1 ??
+# Example expected output:
+#    M vllm/model_executor/models/qwen3_dflash.py
+#    M vllm/v1/spec_decode/dflash.py
+#   ?? vllm/v1/spec_decode/dflash_kv_precompute.py
 ```
 
-Do **not** commit the patch. The orchestrator uses `git stash
-push/pop` to swap between `dflash_optimized` (patch applied) and
-`dflash_original` (patch stashed) within a single run. Keeping the
-patch as tracked working-tree edits is what makes that work.
+**Do not** commit the patch. The orchestrator uses `git stash push/pop`
+to swap between:
+- `dflash_optimized` — patch is in the working tree → fused kernel + early-return run
+- `dflash_original` — patch is `git stash`-ed away → upstream PR #36847 runs
+
+Keeping the patch as *tracked working-tree edits* (not a commit) is
+what makes that single-stash swap work. The orchestrator now
+pre-flights this check and errors out early if the patch is missing
+when a DFlash mode is requested. To bypass (e.g. running for a
+gpt-oss-120b target where you only want no_spec + eagle3), set
+`SKIP_DFLASH_OPT=1 SKIP_DFLASH_ORIG=1`.
+
+Reversing the patch later:
+
+```bash
+cd $VLLM_REPO
+git checkout -- vllm/model_executor/models/qwen3_dflash.py \
+                vllm/v1/spec_decode/dflash.py
+rm vllm/v1/spec_decode/dflash_kv_precompute.py
+```
 
 ### 4.3 Build vLLM
 
